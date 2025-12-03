@@ -1,0 +1,77 @@
+import sys
+import subprocess
+import importlib
+
+"""
+flow.py
+Install (if needed) and import required Python packages.
+
+Usage:
+    python flow.py
+"""
+
+
+# mapping: import_name -> pip_package_name
+REQS = {
+    "os": None,  # builtin
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "sklearn": "scikit-learn",
+    "xgboost": "xgboost",
+    "joblib": "joblib",
+    "matplotlib": "matplotlib",
+    "seaborn": "seaborn",
+}
+
+def install_package(pkg_name):
+    cmd = [sys.executable, "-m", "pip", "install", pkg_name]
+    print(f"Installing {pkg_name}...")
+    try:
+        subprocess.check_call(cmd)
+        return True
+    except subprocess.CalledProcessError:
+        # try with --user as a fallback
+        try:
+            print(f"Retrying install for {pkg_name} with --user...")
+            subprocess.check_call(cmd + ["--user"])
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to install {pkg_name}: {e}")
+            return False
+
+def ensure_packages(reqs):
+    results = {}
+    for import_name, pip_name in reqs.items():
+        if pip_name is None:
+            # builtin module
+            try:
+                importlib.import_module(import_name)
+                results[import_name] = True
+            except Exception:
+                results[import_name] = False
+            continue
+
+        try:
+            importlib.import_module(import_name)
+            print(f"{import_name} is already installed.")
+            results[import_name] = True
+        except ImportError:
+            ok = install_package(pip_name)
+            if ok:
+                try:
+                    importlib.import_module(import_name)
+                    print(f"Successfully installed and imported {import_name}.")
+                    results[import_name] = True
+                except ImportError:
+                    print(f"Installed {pip_name} but could not import {import_name}.")
+                    results[import_name] = False
+            else:
+                results[import_name] = False
+    return results
+
+if __name__ == "__main__":
+    results = ensure_packages(REQS)
+    print("\nSummary:")
+    for name, ok in results.items():
+        status = "OK" if ok else "MISSING"
+        print(f" - {name}: {status}")
