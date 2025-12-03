@@ -1,0 +1,387 @@
+# train_surrogate.py
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, confusion_matrix, classification_report, accuracy_score
+import xgboost as xgb
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# TensorFlow import with proper error handling
+USE_TF = False
+try:
+    import tensorflow as tf
+    from tensorflow.keras import layers, models, callbacks
+    USE_TF = True
+    tf.random.set_seed(42)
+    print("TensorFlow successfully imported")
+except Exception as e:
+    print("TensorFlow import failed, falling back to sklearn MLPRegressor:", e)
+    from sklearn.neural_network import MLPRegressor
+    USE_TF = False
+
+np.random.seed(42)
+
+# --------- Helper: LHS sampler ----------
+def lhs_sample(n_samples, bounds):
+    d = len(bounds)
+    cut = np.linspace(0, 1, n_samples + 1)
+    u = np.random.rand(n_samples, d)
+    samples = np.zeros((n_samples, d))
+    for j in range(d):
+        a = cut[:n_samples]
+        b = cut[1:n_samples + 1]
+        pts = a + u[:, j] * (b - a)
+        np.random.shuffle(pts)
+        lo, hi = bounds[j]
+        samples[:, j] = lo + pts * (hi - lo)
+    return samples
+
+# --------- 0) Load or create dataset ----------
+CSV_PATH = "data.csv"
+if os.path.exists(CSV_PATH):
+    df = pd.read_csv(CSV_PATH)
+    print(f"Loaded data from {CSV_PATH}")
+else:
+    # Create synthetic dataset
+    n = 2000
+    bounds = [
+        (0.5, 30),        # E GPa
+        (0.05, 5.0),      # c MPa
+        (20, 45),         # phi deg
+        (1e-9, 1e-5),     # k m/s
+        (18, 27),         # gamma kN/m3
+        (0.5, 15),        # sigma0 MPa
+        (20, 500),        # depth m
+        (10, 40),         # t_support GPa
+        (30, 85),         # GSI
+    ]
+    X = lhs_sample(n, bounds)
+    
+    # Synthetic responses
+    u_crown = (0.02 * X[:, 6] + 5 * (1 / (X[:, 0] + 1e-6)) + 0.5 * (1 / (X[:, 7] + 1e-6))) * 1.0 + np.random.randn(n) * 0.5
+    u_invert = u_crown * 0.8 + np.random.randn(n) * 0.3
+    FoS = 2 + 0.4 * (X[:, 1]) + 0.01 * (X[:, 2]) - 0.02 * X[:, 5] - 0.001 * X[:, 6] + np.random.randn(n) * 0.05
+    P_index = np.clip(1 - (FoS - 1.0) / 2.0 + np.random.randn(n) * 0.02, 0, 1)
+
+    df = pd.DataFrame(X, columns=['E', 'c', 'phi', 'k', 'gamma', 'sigma0', 'depth', 't_support', 'GSI'])
+    df['u_crown'] = u_crown
+    df['u_invert'] = u_invert
+    df['FoS'] = FoS
+    df['P_index'] = P_index
+    df.to_csv(CSV_PATH, index=False)
+    print(f"Synthetic data saved to {CSV_PATH}")
+
+# --------- 1) Prepare data ----------
+INPUT_COLS = ['E', 'c', 'phi', 'k', 'gamma', 'sigma0', 'depth', 't_support', 'GSI']
+TARGET_COLS = ['u_crown', 'u_invert', 'FoS', 'P_index']
+
+X = df[INPUT_COLS].values
+y = df[TARGET_COLS].values
+
+# Train/val/test split
+X_trainval, X_test, y_trainval, y_test = train_test_split(X, y, test_size=0.15, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(X_trainval, y_trainval, test_size=0.1765, random_state=42)
+
+# Scaling
+scaler_X = StandardScaler().fit(X_train)
+X_train_s = scaler_X.transform(X_train)
+X_val_s = scaler_X.transform(X_val)
+X_test_s = scaler_X.transform(X_test)
+
+scaler_y = StandardScaler().fit(y_train)
+y_train_s = scaler_y.transform(y_train)
+y_val_s = scaler_y.transform(y_val)
+y_test_s = scaler_y.transform(y_test)
+
+print(f"Data shapes - Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+# --------- 2) Train ANN ----------
+def build_ann(input_dim, output_dim):
+    if USE_TF:
+        model = models.Sequential([
+            layers.Input(shape=(input_dim,)),
+            layers.Dense(64, activation='relu'),
+            layers.Dense(128, activation='relu'),
+            layers.Dense(64, activation='relu'),
+            layers.Dense(output_dim)
+        ])
+        model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        return model
+    else:
+        mlp = MLPRegressor(
+            hidden_layer_sizes=(64, 128, 64),
+            activation='relu',
+            solver='adam',
+            max_iter=1000,
+            random_state=42,
+            early_stopping=True,
+            n_iter_no_change=20,
+            validation_fraction=0.1
+        )
+        return mlp
+
+print("Training ANN...")
+ann = build_ann(X_train_s.shape[1], y_train_s.shape[1])
+
+if USE_TF:
+    es = callbacks.EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, verbose=1)
+    history = ann.fit(
+        X_train_s, y_train_s, 
+        validation_data=(X_val_s, y_val_s),
+        epochs=300, 
+        batch_size=32, 
+        callbacks=[es], 
+        verbose=1
+    )
+    ann.save("ann_surrogate.h5")
+    print("ANN (Keras) saved as ann_surrogate.h5")
+else:
+    ann.fit(X_train_s, y_train_s)
+    joblib.dump(ann, "mlp_surrogate.joblib")
+    print("ANN (sklearn) saved as mlp_surrogate.joblib")
+
+# --------- 3) XGBoost (CORRECTED) ----------
+print("Training XGBoost models...")
+xgb_models = {}
+for i, name in enumerate(TARGET_COLS):
+    print(f"Training XGBoost for {name}")
+    
+    # Create model with early_stopping_rounds in constructor
+    model = xgb.XGBRegressor(
+        n_estimators=300, 
+        max_depth=6, 
+        learning_rate=0.05, 
+        tree_method='hist', 
+        random_state=42,
+        early_stopping_rounds=20  # This is now in the constructor
+    )
+    
+    # Fit without early_stopping_rounds parameter
+    model.fit(
+        X_train, y_train[:, i],
+        eval_set=[(X_val, y_val[:, i])],
+        verbose=False
+    )
+    xgb_models[name] = model
+    model.save_model(f"xgb_{name}.json")
+
+joblib.dump(xgb_models, "xgb_models.joblib")
+print("XGBoost models saved")
+
+# --------- 4) SVR ----------
+print("Training SVR models...")
+from sklearn.svm import SVR
+
+svr_models = {}
+for i, name in enumerate(TARGET_COLS):
+    print(f"Training SVR for {name}")
+    svr = SVR(kernel='rbf', C=10, gamma='scale')
+    svr.fit(X_train_s, y_train[:, i])  # Using raw targets for SVR
+    svr_models[name] = svr
+
+joblib.dump(svr_models, "svr_models.joblib")
+print("SVR models saved")
+
+# --------- 5) Evaluation ----------
+def evaluate_model_predict(predict_func, Xs, ys_true, model_name=""):
+    y_pred = predict_func(Xs)
+    
+    results = {}
+    for i, name in enumerate(TARGET_COLS):
+        rmse = np.sqrt(mean_squared_error(ys_true[:, i], y_pred[:, i]))
+        mae = mean_absolute_error(ys_true[:, i], y_pred[:, i])
+        r2 = r2_score(ys_true[:, i], y_pred[:, i])
+        results[name] = {'rmse': rmse, 'mae': mae, 'r2': r2}
+    
+    # Print summary
+    print(f"\n{model_name} Results:")
+    for target, metrics in results.items():
+        print(f"  {target}: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, R²={metrics['r2']:.4f}")
+    
+    return y_pred, results
+
+# ANN prediction wrapper
+def ann_predict(Xs):
+    Xs_scaled = scaler_X.transform(Xs)
+    if USE_TF:
+        y_pred_s = ann.predict(Xs_scaled, verbose=0)
+    else:
+        y_pred_s = ann.predict(Xs_scaled)
+    return scaler_y.inverse_transform(y_pred_s)
+
+# XGBoost prediction wrapper
+def xgb_predict(Xs):
+    preds = np.column_stack([xgb_models[name].predict(Xs) for name in TARGET_COLS])
+    return preds
+
+# SVR prediction wrapper  
+def svr_predict(Xs):
+    Xs_scaled = scaler_X.transform(Xs)
+    preds = np.column_stack([svr_models[name].predict(Xs_scaled) for name in TARGET_COLS])
+    return preds
+
+# Evaluate all models
+print("\n" + "="*50)
+print("MODEL EVALUATION ON TEST SET")
+print("="*50)
+
+y_ann_test, ann_results = evaluate_model_predict(ann_predict, X_test, y_test, "ANN")
+y_xgb_test, xgb_results = evaluate_model_predict(xgb_predict, X_test, y_test, "XGBoost")
+y_svr_test, svr_results = evaluate_model_predict(svr_predict, X_test, y_test, "SVR")
+
+# --------- 6) Create Confusion Matrices from Regression Outputs ----------
+print("\nCreating confusion matrices from regression outputs...")
+
+# Define classification thresholds
+FOS_SAFE_THRESHOLD = 1.2  # FoS > 1.2 is considered safe
+PINDEX_LOW_RISK_THRESHOLD = 0.3  # P_index < 0.3 is considered low risk
+
+# Convert regression outputs to classification predictions
+def regression_to_classification(y_true, y_pred, target_name, threshold, greater_than=True):
+    """Convert regression outputs to binary classification"""
+    if greater_than:
+        true_classes = (y_true > threshold).astype(int)
+        pred_classes = (y_pred > threshold).astype(int)
+    else:
+        true_classes = (y_true < threshold).astype(int)
+        pred_classes = (y_pred < threshold).astype(int)
+    return true_classes, pred_classes
+
+# Get indices for FoS and P_index in the target columns
+fos_idx = TARGET_COLS.index('FoS')
+pindex_idx = TARGET_COLS.index('P_index')
+
+# Create confusion matrices for each model
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+# ANN Confusion Matrices
+true_fos_ann, pred_fos_ann = regression_to_classification(
+    y_test[:, fos_idx], y_ann_test[:, fos_idx], 'FoS', FOS_SAFE_THRESHOLD, greater_than=True
+)
+true_pindex_ann, pred_pindex_ann = regression_to_classification(
+    y_test[:, pindex_idx], y_ann_test[:, pindex_idx], 'P_index', PINDEX_LOW_RISK_THRESHOLD, greater_than=False
+)
+
+# XGBoost Confusion Matrices
+true_fos_xgb, pred_fos_xgb = regression_to_classification(
+    y_test[:, fos_idx], y_xgb_test[:, fos_idx], 'FoS', FOS_SAFE_THRESHOLD, greater_than=True
+)
+true_pindex_xgb, pred_pindex_xgb = regression_to_classification(
+    y_test[:, pindex_idx], y_xgb_test[:, pindex_idx], 'P_index', PINDEX_LOW_RISK_THRESHOLD, greater_than=False
+)
+
+# SVR Confusion Matrices
+true_fos_svr, pred_fos_svr = regression_to_classification(
+    y_test[:, fos_idx], y_svr_test[:, fos_idx], 'FoS', FOS_SAFE_THRESHOLD, greater_than=True
+)
+true_pindex_svr, pred_pindex_svr = regression_to_classification(
+    y_test[:, pindex_idx], y_svr_test[:, pindex_idx], 'P_index', PINDEX_LOW_RISK_THRESHOLD, greater_than=False
+)
+
+# Plot FoS confusion matrices (first row)
+models_fos = [
+    ('ANN', true_fos_ann, pred_fos_ann),
+    ('XGBoost', true_fos_xgb, pred_fos_xgb),
+    ('SVR', true_fos_svr, pred_fos_svr)
+]
+
+for idx, (model_name, true, pred) in enumerate(models_fos):
+    cm = confusion_matrix(true, pred)
+    accuracy = accuracy_score(true, pred)
+    
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0, idx],
+               xticklabels=['Unsafe', 'Safe'], yticklabels=['Unsafe', 'Safe'])
+    axes[0, idx].set_title(f'{model_name} - FoS Classification\nAccuracy: {accuracy:.3f}')
+    axes[0, idx].set_xlabel('Predicted')
+    axes[0, idx].set_ylabel('Actual')
+
+# Plot P_index confusion matrices (second row)
+models_pindex = [
+    ('ANN', true_pindex_ann, pred_pindex_ann),
+    ('XGBoost', true_pindex_xgb, pred_pindex_xgb),
+    ('SVR', true_pindex_svr, pred_pindex_svr)
+]
+
+for idx, (model_name, true, pred) in enumerate(models_pindex):
+    cm = confusion_matrix(true, pred)
+    accuracy = accuracy_score(true, pred)
+    
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[1, idx],
+               xticklabels=['High Risk', 'Low Risk'], yticklabels=['High Risk', 'Low Risk'])
+    axes[1, idx].set_title(f'{model_name} - P_index Classification\nAccuracy: {accuracy:.3f}')
+    axes[1, idx].set_xlabel('Predicted')
+    axes[1, idx].set_ylabel('Actual')
+
+plt.tight_layout()
+plt.savefig('confusion_matrices_from_regression.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Print classification reports
+print("\n" + "="*50)
+print("CLASSIFICATION PERFORMANCE FROM REGRESSION OUTPUTS")
+print("="*50)
+
+print("\nFoS Classification (Safe if > 1.2):")
+for model_name, true, pred in models_fos:
+    print(f"\n{model_name}:")
+    print(classification_report(true, pred, target_names=['Unsafe', 'Safe']))
+
+print("\nP_index Classification (Low Risk if < 0.3):")
+for model_name, true, pred in models_pindex:
+    print(f"\n{model_name}:")
+    print(classification_report(true, pred, target_names=['High Risk', 'Low Risk']))
+
+# --------- 7) Monte Carlo Analysis ----------
+def monte_carlo_pcollapse(x_nominal, n_mc=1000):
+    samples = np.tile(x_nominal, (n_mc, 1)).astype(float)
+    
+    # Perturb parameters
+    c_idx = INPUT_COLS.index('c')
+    phi_idx = INPUT_COLS.index('phi')
+    sigma_idx = INPUT_COLS.index('sigma0')
+    depth_idx = INPUT_COLS.index('depth')
+
+    samples[:, c_idx] *= np.random.lognormal(mean=0.0, sigma=0.2, size=n_mc)
+    samples[:, phi_idx] += np.random.randn(n_mc) * 3.0
+    samples[:, sigma_idx] *= np.random.lognormal(mean=0.0, sigma=0.15, size=n_mc)
+    samples[:, depth_idx] += np.random.randn(n_mc) * 1.0
+
+    # Predict using ANN surrogate
+    y_pred = ann_predict(samples)
+    FoS_samples = y_pred[:, TARGET_COLS.index('FoS')]
+    
+    p_collapse = np.mean(FoS_samples < 1.0)
+    return p_collapse, FoS_samples
+
+# Example Monte Carlo
+print("\nRunning Monte Carlo analysis...")
+x_example = X_test[0]
+p_est, fos_samps = monte_carlo_pcollapse(x_example, n_mc=2000)
+print(f"Estimated P_collapse (ANN surrogate) = {p_est:.4f}")
+
+# --------- 8) Save all models and scalers ----------
+joblib.dump(scaler_X, "scaler_X.joblib")
+joblib.dump(scaler_y, "scaler_y.joblib")
+print("\nAll models and scalers saved successfully!")
+
+# --------- 9) Create parity plots ----------
+plt.figure(figsize=(12, 8))
+for i, target in enumerate(TARGET_COLS):
+    plt.subplot(2, 2, i+1)
+    plt.scatter(y_test[:, i], y_ann_test[:, i], alpha=0.5, label='ANN', s=20)
+    plt.scatter(y_test[:, i], y_xgb_test[:, i], alpha=0.5, label='XGBoost', s=20)
+    plt.scatter(y_test[:, i], y_svr_test[:, i], alpha=0.5, label='SVR', s=20)
+    plt.plot([y_test[:, i].min(), y_test[:, i].max()], [y_test[:, i].min(), y_test[:, i].max()], 'k--')
+    plt.xlabel('True')
+    plt.ylabel('Predicted')
+    plt.title(f'{target} Predictions')
+    plt.legend()
+plt.tight_layout()
+plt.savefig('model_comparison.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+print("\nTraining completed successfully!")
