@@ -6,6 +6,7 @@ It is for EDUCATIONAL PURPOSES ONLY. if you need an actual model ask an engineer
 
 (it's in the ohter branch) (main-code)
 
+further updated version might happen!
 
 my first project!
 
